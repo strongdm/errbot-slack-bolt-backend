@@ -74,7 +74,6 @@ COLORS = {
     "cyan": "#00FFFF",
 }  # Slack doesn't know its colors
 
-
 MARKDOWN_LINK_REGEX = re.compile(
     r"(?<!!)\[(?P<text>[^\]]+?)\]\((?P<uri>[a-zA-Z0-9]+?:\S+?)\)"
 )
@@ -180,6 +179,7 @@ class SlackPerson(Person):
         self._email = user.get('profile').get('email') if user.get('profile') else None
         self._is_deleted = user.get('deleted')
         self._webclient = webclient
+        self._botid = user.get('bot_id')
 
     @property
     def userid(self):
@@ -273,7 +273,7 @@ class SlackPerson(Person):
 
     def __hash__(self):
         return self.userid.__hash__()
-    
+
     @property
     def is_deleted(self):
         return self._is_deleted
@@ -298,7 +298,7 @@ class SlackRoomOccupant(RoomOccupant, SlackPerson):
     @property
     def room(self):
         return self._room
-    
+
     @property
     def email(self):
         return self._email
@@ -325,10 +325,10 @@ class SlackBot(SlackPerson):
     This class describes a bot on Slack's network.
     """
 
-    def __init__(self, webclient: WebClient, bot_id, bot_username):
+    def __init__(self, webclient: WebClient, bot_id, bot_username, user_id=None):
         self._bot_id = bot_id
         self._bot_username = bot_username
-        super().__init__(webclient, userid=bot_id)
+        super().__init__(webclient, user={'id': user_id, 'bot_id': bot_id})
 
     @property
     def username(self):
@@ -353,13 +353,17 @@ class SlackRoomBot(RoomOccupant, SlackBot):
     This class represents a bot inside a MUC.
     """
 
-    def __init__(self, sc, bot_id, bot_username, channelid, bot):
+    def __init__(self, sc, bot_id, bot_username, channelid, bot, extras=None):
         super().__init__(sc, bot_id, bot_username)
         self._room = SlackRoom(webclient=sc, channelid=channelid, bot=bot)
 
     @property
     def room(self):
         return self._room
+
+    @property
+    def id(self):
+        return self._bot_id
 
     def __unicode__(self):
         return f"#{self._room.name}/{self.username}"
@@ -469,7 +473,6 @@ class SlackBoltBackend(ErrBot):
         self._setup_slack_callbacks()
 
         self.update_alternate_prefixes()
-
 
         try:
             log.info("Connecting to Slack socket")
@@ -611,13 +614,21 @@ class SlackBoltBackend(ErrBot):
             raise UserDoesNotExistError(f"Cannot find user with ID {id_}.")
         return user["name"]
 
-    def username_to_userid(self, name: str):
-        """Convert a Slack user name to their user ID"""
+    def username_to_user(self, name: str):
+        """Convert a Slack user name to their user"""
         name = name.lstrip("@")
         user = self.__find_user_by_name(name)
         if not user:
             raise UserDoesNotExistError(f"Cannot find user {name}.")
+        return user
+
+    def username_to_userid(self, name: str):
+        user = self.username_to_user(name)
         return user["id"]
+
+    def username_to_bot_id(self, name: str):
+        user = self.username_to_user(name)
+        return user["profile"]["bot_id"]
 
     def __find_user_by_name(self, name, is_first_call=True):
         users = self.__get_users()
@@ -626,7 +637,15 @@ class SlackBoltBackend(ErrBot):
             self.clear_users_cache()
             return self.__find_user_by_name(name, is_first_call=False)
         return user
-    
+
+    def __find_user_by_id(self, id_: str, is_first_call=True):
+        users = self.__get_users()
+        user = Utils.get_item_by_key(users, 'id', id_)
+        if not user and is_first_call:
+            self.clear_users_cache()
+            return self.__find_user_by_id(id_, is_first_call=False)
+        return user
+
     @cached(ttl=CACHE_TTL_SECONDS)
     def __get_users(self):
         users = Utils.get_items(self.__get_users_page)
@@ -710,9 +729,10 @@ class SlackBoltBackend(ErrBot):
           - Conversations list: https://api.slack.com/methods/conversations.list
         """
         # TODO: consider remove "exclude_archived"
-        conversations = self.__fetch_conversations(joined_only=joined_only, exclude_archived=exclude_archived, types=types)
+        conversations = self.__fetch_conversations(joined_only=joined_only, exclude_archived=exclude_archived,
+                                                   types=types)
 
-        return conversations # + groups
+        return conversations  # + groups
 
     def __fetch_conversations(self, joined_only, **kwargs):
         conversations = self.__get_conversations(**kwargs)
@@ -1069,9 +1089,11 @@ class SlackBoltBackend(ErrBot):
         if userid is not None and channelid is not None:
             return SlackRoomOccupant(self.webclient, user, channelid, bot=self)
         if userid is not None:
+            user = self.__find_user_by_id(userid)
             return SlackPerson(self.webclient, user, channelid=self.get_im_channel(userid))
         if channelid is not None:
-            return SlackRoom(webclient=self.webclient, channelid=channelid, bot=self, is_archived=channel['is_archived'])
+            return SlackRoom(webclient=self.webclient, channelid=channelid, bot=self,
+                             is_archived=channel['is_archived'])
 
         raise Exception(
             "You found a bug. I expected at least one of userid, channelid, username or channelname "
@@ -1228,6 +1250,10 @@ class SlackBoltBackend(ErrBot):
                 text = text.replace(word, str(identifier))
 
         return text, mentioned
+
+    def resolve_access_form_bot_id(self):
+        bot_id = self.username_to_bot_id(self.bot_config.ACCESS_FORM_BOT_INFO.get('nickname'))
+        self.bot_config.ACCESS_FORM_BOT_INFO['bot_id'] = bot_id
 
 
 class SlackRoom(Room):
